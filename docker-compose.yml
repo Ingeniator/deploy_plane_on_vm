@@ -4,11 +4,15 @@ services:
     restart: always
     env_file: .env
     ports:
-      - "${LISTEN_HTTP_PORT:-80}:80"
-      - "${LISTEN_HTTPS_PORT:-443}:443"
+      - "${LISTEN_HTTP_PORT:-8080}:80"
+      - "${LISTEN_HTTPS_PORT:-8443}:443"
     volumes:
-      - aio_data:/app/data
-      - aio_logs:/app/logs
+      - type: bind
+        source: ${DATA_DIR}/aio/data
+        target: /app/data
+      - type: bind
+        source: ${DATA_DIR}/aio/logs
+        target: /app/logs
     depends_on:
       plane-db:
         condition: service_healthy
@@ -29,7 +33,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       PGDATA: /var/lib/postgresql/data
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - type: bind
+        source: ${DATA_DIR}/pgdata
+        target: /var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-plane} -d ${POSTGRES_DB:-plane}"]
       interval: 10s
@@ -41,7 +47,9 @@ services:
     image: ${REGISTRY}/valkey/valkey:7.2.11-alpine
     restart: always
     volumes:
-      - redisdata:/data
+      - type: bind
+        source: ${DATA_DIR}/redis
+        target: /data
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 10s
@@ -57,7 +65,9 @@ services:
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
       RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-plane}
     volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
+      - type: bind
+        source: ${DATA_DIR}/rabbitmq
+        target: /var/lib/rabbitmq
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 30s
@@ -73,18 +83,12 @@ services:
       MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID}
       MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY}
     volumes:
-      - uploads:/export
+      - type: bind
+        source: ${DATA_DIR}/minio
+        target: /export
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 15s
-
-volumes:
-  pgdata:
-  redisdata:
-  rabbitmq_data:
-  uploads:
-  aio_data:
-  aio_logs:

@@ -8,13 +8,13 @@ set -euo pipefail
 
 # ------------------------------------------------------------------ config ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="${SCRIPT_DIR}/data"
 COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
 ENV_FILE="${SCRIPT_DIR}/.env"
 LOCK_FILE="/tmp/plane-deploy.lock"
 LOG_FILE="${SCRIPT_DIR}/deploy.log"
 PREV_RELEASE_FILE="${SCRIPT_DIR}/.previous_release"
 
-HEALTH_URL="${HEALTH_URL:-http://localhost/}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-300}"
 HEALTH_INTERVAL=5
 
@@ -40,6 +40,44 @@ detect_runtime() {
     echo "docker"
   else
     die "No container runtime found. Install podman or docker."
+  fi
+}
+
+check_rootless() {
+  local runtime="$1"
+  [[ "$EUID" -eq 0 ]] && return 0  # running as root — no special handling needed
+
+  log INFO "Rootless mode detected (UID=${EUID})."
+
+  # Docker rootless uses a per-user socket
+  if [[ "$runtime" == "docker" ]]; then
+    local docker_sock="${XDG_RUNTIME_DIR:-/run/user/${EUID}}/docker.sock"
+    if [[ -S "$docker_sock" ]]; then
+      export DOCKER_HOST="unix://${docker_sock}"
+      log INFO "Set DOCKER_HOST=${DOCKER_HOST}"
+    else
+      log WARN "Docker rootless socket not found at ${docker_sock}. Is dockerd --rootless running?"
+    fi
+  fi
+
+  # Ports < 1024 are blocked for unprivileged users
+  local http_port="${LISTEN_HTTP_PORT:-8080}"
+  if (( http_port < 1024 )); then
+    local unpriv
+    unpriv=$(sysctl -n net.ipv4.ip_unprivileged_port_start 2>/dev/null || echo "1024")
+    if (( http_port < unpriv )); then
+      log WARN "Port ${http_port} requires root or lowering net.ipv4.ip_unprivileged_port_start."
+      log WARN "Run: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=${http_port}"
+      log WARN "Or set LISTEN_HTTP_PORT=8080 in .env to use an unprivileged port."
+    fi
+  fi
+
+  # Containers stop when the SSH session ends unless linger is enabled
+  if command -v loginctl &>/dev/null; then
+    if ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
+      log WARN "Linger is not enabled — containers will stop when you log out."
+      log WARN "Run: loginctl enable-linger ${USER}"
+    fi
   fi
 }
 
@@ -71,7 +109,11 @@ acquire_lock() {
 set_env_var() {
   local key="$1" val="$2"
   local esc; esc=$(printf '%s' "$val" | sed 's/[|&\]/\\&/g')
-  "${SED_I[@]}" "s|^${key}=.*|${key}=${esc}|" "$ENV_FILE"
+  if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+    "${SED_I[@]}" "s|^${key}=.*|${key}=${esc}|" "$ENV_FILE"
+  else
+    echo "${key}=${val}" >> "$ENV_FILE"
+  fi
 }
 
 prompt_secret() {
@@ -90,6 +132,14 @@ setup_env() {
   log INFO "First-time setup — creating .env from .env.example"
   cp "${SCRIPT_DIR}/.env.example" "$ENV_FILE"
 
+  # Data directory
+  local data_dir
+  read -rp "  Persistent data directory [${SCRIPT_DIR}/data]: " data_dir
+  data_dir="${data_dir:-${SCRIPT_DIR}/data}"
+  data_dir="${data_dir/#\~/$HOME}"
+  [[ "$data_dir" != /* ]] && data_dir="${SCRIPT_DIR}/${data_dir}"
+  set_env_var "DATA_DIR" "$data_dir"
+
   # Registry
   local registry
   read -rp "  Private registry URL [docker.io]: " registry
@@ -102,8 +152,9 @@ setup_env() {
   vm_ip="${vm_ip:-127.0.0.1}"
   set_env_var "DOMAIN_NAME"          "$vm_ip"
   set_env_var "APP_DOMAIN"           "$vm_ip"
-  set_env_var "WEB_URL"              "http://${vm_ip}"
-  set_env_var "CORS_ALLOWED_ORIGINS" "http://${vm_ip}"
+  local http_port="${LISTEN_HTTP_PORT:-8080}"
+  set_env_var "WEB_URL"              "http://${vm_ip}:${http_port}"
+  set_env_var "CORS_ALLOWED_ORIGINS" "http://${vm_ip}:${http_port}"
   set_env_var "API_BASE_URL"         "http://${vm_ip}:3004"
 
   # Passwords — prompt with auto-generate fallback
@@ -163,6 +214,17 @@ registry_login() {
     || die "Registry login failed."
 }
 
+# ------------------------------------------------------------------ compose image parsing ---
+# Reads image names from docker-compose.yml and substitutes env vars.
+# Avoids duplicating image tags between this script and the compose file.
+parse_compose_images() {
+  grep '^\s*image:' "$COMPOSE_FILE" \
+    | awk '{print $2}' \
+    | sed \
+        -e "s|\${REGISTRY}|${REGISTRY}|g" \
+        -e "s|\${APP_RELEASE:-stable}|${APP_RELEASE:-stable}|g"
+}
+
 # ------------------------------------------------------------------ image pull with retry ---
 pull_image() {
   local image="$1"
@@ -181,19 +243,15 @@ pull_image() {
 }
 
 pull_infra_images() {
-  local images=(
-    "${REGISTRY}/postgres:15.7-alpine"
-    "${REGISTRY}/valkey/valkey:7.2.11-alpine"
-    "${REGISTRY}/rabbitmq:3.13.6-management-alpine"
-    "${REGISTRY}/minio/minio:latest"
-  )
-  for img in "${images[@]}"; do
+  local img
+  while IFS= read -r img; do
+    [[ "$img" == *"plane-aio-community"* ]] && continue
     if $RUNTIME image inspect "$img" &>/dev/null; then
       log INFO "Infra image already present, skipping pull: ${img}"
     else
       pull_image "$img"
     fi
-  done
+  done < <(parse_compose_images)
 }
 
 # ------------------------------------------------------------------ health check ---
@@ -235,12 +293,14 @@ do_deploy() {
   local COMPOSE; COMPOSE=$(detect_compose)
   local RUNTIME; RUNTIME=$(detect_runtime)
   log INFO "Using compose: ${COMPOSE}, runtime: ${RUNTIME}"
+  check_rootless "$RUNTIME"
 
   load_env
+  local HEALTH_URL="http://localhost:${LISTEN_HTTP_PORT:-8080}/"
   registry_login
 
-  local release="${APP_RELEASE:-stable}"
-  local aio_image="${REGISTRY}/makeplane/plane-aio-community:${release}"
+  local aio_image
+  aio_image=$(parse_compose_images | grep "plane-aio-community")
 
   # Record current running release before we change anything
   local current_release
@@ -258,6 +318,17 @@ do_deploy() {
   pull_image "$aio_image"
 
   cd "$SCRIPT_DIR"
+
+  # Create bind-mount directories (Podman/Docker won't do this automatically)
+  log INFO "Creating data directories under ${DATA_DIR}..."
+  mkdir -p \
+    "${DATA_DIR}/pgdata" \
+    "${DATA_DIR}/redis" \
+    "${DATA_DIR}/rabbitmq" \
+    "${DATA_DIR}/minio" \
+    "${DATA_DIR}/aio/data" \
+    "${DATA_DIR}/aio/logs/access" \
+    "${DATA_DIR}/aio/logs/error"
 
   # Start infra services (idempotent — skips already-running containers)
   log INFO "Starting infrastructure services..."
@@ -291,7 +362,7 @@ do_deploy() {
   $RUNTIME image prune -f >> "$LOG_FILE" 2>&1 || true
 
   log INFO "=== Deploy complete: ${aio_image} ==="
-  log INFO "Plane is up at http://${APP_DOMAIN:-localhost}/"
+  log INFO "Plane is up at http://${APP_DOMAIN:-localhost}:${LISTEN_HTTP_PORT:-8080}/"
 }
 
 # ------------------------------------------------------------------ entry ---
@@ -302,6 +373,7 @@ case "${1:-}" in
     load_env
     COMPOSE=$(detect_compose)
     RUNTIME=$(detect_runtime)
+    check_rootless "$RUNTIME"
     cd "$SCRIPT_DIR"
     do_rollback
     ;;
