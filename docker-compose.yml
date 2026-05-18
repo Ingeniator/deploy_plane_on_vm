@@ -1,0 +1,90 @@
+services:
+  plane-aio:
+    image: ${REGISTRY}/makeplane/plane-aio-community:${APP_RELEASE:-stable}
+    restart: always
+    env_file: .env
+    ports:
+      - "${LISTEN_HTTP_PORT:-80}:80"
+      - "${LISTEN_HTTPS_PORT:-443}:443"
+    volumes:
+      - aio_data:/app/data
+      - aio_logs:/app/logs
+    depends_on:
+      plane-db:
+        condition: service_healthy
+      plane-redis:
+        condition: service_healthy
+      plane-mq:
+        condition: service_healthy
+      plane-minio:
+        condition: service_started
+
+  plane-db:
+    image: ${REGISTRY}/postgres:15.7-alpine
+    restart: always
+    command: postgres -c 'max_connections=1000'
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-plane}
+      POSTGRES_DB: ${POSTGRES_DB:-plane}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-plane} -d ${POSTGRES_DB:-plane}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  plane-redis:
+    image: ${REGISTRY}/valkey/valkey:7.2.11-alpine
+    restart: always
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  plane-mq:
+    image: ${REGISTRY}/rabbitmq:3.13.6-management-alpine
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-plane}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-plane}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  plane-minio:
+    image: ${REGISTRY}/minio/minio:latest
+    restart: always
+    command: server /export --console-address ":9090"
+    environment:
+      MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID}
+      MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY}
+    volumes:
+      - uploads:/export
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  pgdata:
+  redisdata:
+  rabbitmq_data:
+  uploads:
+  aio_data:
+  aio_logs:
