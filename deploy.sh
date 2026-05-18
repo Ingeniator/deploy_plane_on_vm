@@ -60,6 +60,28 @@ check_rootless() {
     fi
   fi
 
+  # Rootless Podman requires subuid/subgid mappings — without them containers can't
+  # create user namespaces and will fail immediately
+  if [[ "$runtime" == "podman" ]]; then
+    local missing=()
+    grep -q "^${USER}:" /etc/subuid 2>/dev/null || missing+=("/etc/subuid")
+    grep -q "^${USER}:" /etc/subgid 2>/dev/null || missing+=("/etc/subgid")
+    if (( ${#missing[@]} > 0 )); then
+      log WARN "User '${USER}' has no entries in: ${missing[*]}"
+      log WARN "Rootless Podman needs subordinate UID/GID mappings to run containers."
+      local answer
+      read -rp "  Run 'usermod --add-subuids/subgids 100000-165535' for '${USER}' now? [Y/n]: " answer
+      answer="${answer:-Y}"
+      if [[ "$answer" =~ ^[Yy] ]]; then
+        sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
+        log INFO "Subordinate UID/GID mappings added for ${USER}."
+        log WARN "Run 'podman system migrate' or log out/in for the mapping to take effect."
+      else
+        log WARN "Skipping. Rootless Podman will likely fail without subuid/subgid mappings."
+      fi
+    fi
+  fi
+
   # Ports < 1024 are blocked for unprivileged users
   local http_port="${LISTEN_HTTP_PORT:-8080}"
   if (( http_port < 1024 )); then
