@@ -97,8 +97,16 @@ check_rootless() {
   # Containers stop when the SSH session ends unless linger is enabled
   if command -v loginctl &>/dev/null; then
     if ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
-      log WARN "Linger is not enabled — containers will stop when you log out."
-      log WARN "Run: loginctl enable-linger ${USER}"
+      log WARN "Linger is not enabled — containers will stop when you disconnect SSH."
+      local answer
+      read -rp "  Enable linger for '${USER}' now (keeps containers alive after logout)? [Y/n]: " answer
+      answer="${answer:-Y}"
+      if [[ "$answer" =~ ^[Yy] ]]; then
+        loginctl enable-linger "$USER"
+        log INFO "Linger enabled for ${USER}. Containers will survive SSH disconnects."
+      else
+        log WARN "Skipping. Plane will stop when you disconnect SSH."
+      fi
     fi
   fi
 }
