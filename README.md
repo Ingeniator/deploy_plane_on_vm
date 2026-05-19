@@ -169,6 +169,9 @@ If the VM is hosted on AWS, GCP, Azure, or similar, you must also open ports in 
 | `http://<VM_IP>/` | Main app (via port 80 → 8080 redirect) |
 | `http://<VM_IP>:8080/` | Main app (direct) |
 | `http://<VM_IP>/god-mode/` | Admin panel (trailing slash required) |
+| `http://<VM_IP>:9000/` | MinIO API (file upload/download pre-signed URLs) |
+
+> **Why is port 9000 required?** Plane generates pre-signed URLs for file uploads and downloads. These URLs are sent to the browser, which then contacts MinIO directly. The URL is built from `AWS_S3_ENDPOINT_URL`, which must be a browser-reachable address — not the internal `plane-minio:9000` Docker hostname. Port 9000 must be open in both the OS firewall and any cloud security group.
 
 > Always type the full `http://` scheme — browsers may silently upgrade to HTTPS otherwise.
 
@@ -263,6 +266,8 @@ docker compose up -d --force-recreate plane-aio
 | `CORS_ALLOWED_ORIGINS` | `http://<IP>:<PORT>` | Auto-set from IP + port during setup |
 | `LISTEN_HTTP_PORT` | `8080` | Host port mapped to container port 80 |
 | `LISTEN_HTTPS_PORT` | `8443` | Host port mapped to container port 443 |
+| `MINIO_PORT` | `9000` | Host port for MinIO API; must match `AWS_S3_ENDPOINT_URL` |
+| `AWS_S3_ENDPOINT_URL` | `http://<IP>:9000` | Public MinIO URL sent to browsers in pre-signed links |
 | `POSTGRES_PASSWORD` | *(generated)* | Also embedded in `DATABASE_URL` |
 | `RABBITMQ_PASSWORD` | *(generated)* | Also embedded in `AMQP_URL` |
 | `SECRET_KEY` | *(generated)* | Django secret — do not change after first deploy |
@@ -321,6 +326,13 @@ podman image prune -f        # remove dangling images
 
 **Setup interrupted — `.env` removed on next run:**  
 Intentional. The EXIT trap checks for `SETUP_COMPLETE=1` and removes the partial file so the next run starts clean.
+
+**File uploads fail / browser requests go to `http://plane-minio:9000`:**  
+`AWS_S3_ENDPOINT_URL` is set to the internal Docker hostname. Plane embeds this URL in pre-signed upload/download links sent to the browser — the browser can't resolve `plane-minio`. Fix: ensure `AWS_S3_ENDPOINT_URL=http://<VM_IP>:9000` in `.env` and that port 9000 is open in the firewall and cloud security group. Re-run `setup_env` or edit `.env` and recreate the AIO container:
+```bash
+# Edit .env: set AWS_S3_ENDPOINT_URL=http://<VM_IP>:9000
+podman-compose up -d --force-recreate plane-aio
+```
 
 **Stale lock file:**
 ```bash

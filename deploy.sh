@@ -203,6 +203,11 @@ setup_env() {
   minio_secret=$(prompt_secret "MinIO secret key")
   set_env_var "AWS_SECRET_ACCESS_KEY" "$minio_secret"
 
+  # MinIO must be reachable by the browser — pre-signed upload/download URLs embed
+  # this address. Using the VM's public IP on port 9000 (exposed in docker-compose).
+  local minio_port="${MINIO_PORT:-9000}"
+  set_env_var "AWS_S3_ENDPOINT_URL" "http://${vm_ip}:${minio_port}"
+
   # Crypto secrets — always auto-generated, no reason to choose manually
   set_env_var "SECRET_KEY"             "$(openssl rand -hex 32)"
   set_env_var "LIVE_SERVER_SECRET_KEY" "$(openssl rand -hex 16)"
@@ -322,6 +327,7 @@ do_rollback() {
 configure_firewall() {
   local http_port="${LISTEN_HTTP_PORT:-8080}"
   local https_port="${LISTEN_HTTPS_PORT:-8443}"
+  local minio_port="${MINIO_PORT:-9000}"
 
   # Detect active firewall
   local fw_type="none"
@@ -342,16 +348,19 @@ configure_firewall() {
   # firewalld: --add-forward-port opens port 80 and redirects to http_port in one
   # rule — no need to open http_port separately (firewalld handles this internally)
   if [[ "$fw_type" == "firewalld" ]]; then
-    local fwd_set=false https_open=false
+    local fwd_set=false https_open=false minio_open=false
     if sudo firewall-cmd --query-forward-port="port=80:proto=tcp:toport=${http_port}" &>/dev/null 2>&1; then
       fwd_set=true
     fi
     if sudo firewall-cmd --query-port="${https_port}/tcp" &>/dev/null 2>&1; then
       https_open=true
     fi
+    if sudo firewall-cmd --query-port="${minio_port}/tcp" &>/dev/null 2>&1; then
+      minio_open=true
+    fi
 
-    if $fwd_set && $https_open; then
-      log INFO "firewalld already configured (80→${http_port} forward + ${https_port} open). Nothing to do."
+    if $fwd_set && $https_open && $minio_open; then
+      log INFO "firewalld already configured (80→${http_port} forward + ${https_port} + ${minio_port} open). Nothing to do."
       return 0
     fi
 
@@ -359,6 +368,7 @@ configure_firewall() {
     log INFO "Firewall changes needed (firewalld):"
     $fwd_set    || log INFO "  - Add forward-port: 80 → ${http_port} (access without port in URL)"
     $https_open || log INFO "  - Open port ${https_port}/tcp"
+    $minio_open || log INFO "  - Open port ${minio_port}/tcp (MinIO — required for file uploads)"
     local answer
     read -rp "  Apply firewall changes now (requires sudo)? [Y/n]: " answer
     answer="${answer:-Y}"
@@ -369,6 +379,7 @@ configure_firewall() {
 
     $fwd_set    || sudo firewall-cmd --add-forward-port="port=80:proto=tcp:toport=${http_port}" --permanent
     $https_open || sudo firewall-cmd --add-port="${https_port}/tcp" --permanent
+    $minio_open || sudo firewall-cmd --add-port="${minio_port}/tcp" --permanent
     sudo firewall-cmd --reload
     log INFO "Firewall configuration complete."
     return 0
@@ -383,13 +394,15 @@ configure_firewall() {
     ufw)
       local ufw_status; ufw_status=$(sudo ufw status 2>/dev/null)
       if echo "$ufw_status" | grep -q "${http_port}" && \
-         echo "$ufw_status" | grep -q "${https_port}"; then
+         echo "$ufw_status" | grep -q "${https_port}" && \
+         echo "$ufw_status" | grep -q "${minio_port}"; then
         ports_open=true
       fi
       ;;
     iptables)
       if sudo iptables -C INPUT -p tcp --dport "$http_port" -j ACCEPT &>/dev/null && \
-         sudo iptables -C INPUT -p tcp --dport "$https_port" -j ACCEPT &>/dev/null; then
+         sudo iptables -C INPUT -p tcp --dport "$https_port" -j ACCEPT &>/dev/null && \
+         sudo iptables -C INPUT -p tcp --dport "$minio_port" -j ACCEPT &>/dev/null; then
         ports_open=true
       fi
       ;;
@@ -407,7 +420,7 @@ configure_firewall() {
 
   printf '\n'
   log INFO "Firewall changes needed (${fw_type}):"
-  $ports_open   || log INFO "  - Open ports ${http_port}/tcp and ${https_port}/tcp"
+  $ports_open   || log INFO "  - Open ports ${http_port}/tcp, ${https_port}/tcp, and ${minio_port}/tcp (MinIO)"
   $redirect_set || log INFO "  - Add iptables NAT redirect: 80 → ${http_port} (access without port in URL)"
   local answer
   read -rp "  Apply firewall changes now (requires sudo)? [Y/n]: " answer
@@ -418,19 +431,21 @@ configure_firewall() {
   fi
 
   if ! $ports_open; then
-    log INFO "Opening ports ${http_port} and ${https_port}..."
+    log INFO "Opening ports ${http_port}, ${https_port}, and ${minio_port}..."
     case "$fw_type" in
       ufw)
         sudo ufw allow "${http_port}/tcp"
         sudo ufw allow "${https_port}/tcp"
+        sudo ufw allow "${minio_port}/tcp"
         sudo ufw reload
         ;;
       iptables)
         sudo iptables -A INPUT -p tcp --dport "$http_port" -j ACCEPT
         sudo iptables -A INPUT -p tcp --dport "$https_port" -j ACCEPT
+        sudo iptables -A INPUT -p tcp --dport "$minio_port" -j ACCEPT
         ;;
     esac
-    log INFO "Ports ${http_port} and ${https_port} opened."
+    log INFO "Ports ${http_port}, ${https_port}, and ${minio_port} opened."
   fi
 
   if ! $redirect_set; then
