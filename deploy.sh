@@ -430,6 +430,8 @@ configure_firewall() {
     return 0
   fi
 
+  local iptables_changed=false
+
   if ! $ports_open; then
     log INFO "Opening ports ${http_port}, ${https_port}, and ${minio_port}..."
     case "$fw_type" in
@@ -440,9 +442,14 @@ configure_firewall() {
         sudo ufw reload
         ;;
       iptables)
-        sudo iptables -A INPUT -p tcp --dport "$http_port" -j ACCEPT
-        sudo iptables -A INPUT -p tcp --dport "$https_port" -j ACCEPT
-        sudo iptables -A INPUT -p tcp --dport "$minio_port" -j ACCEPT
+        # Only add rules that are not already present
+        sudo iptables -C INPUT -p tcp --dport "$http_port"  -j ACCEPT &>/dev/null || \
+          sudo iptables -A INPUT -p tcp --dport "$http_port"  -j ACCEPT
+        sudo iptables -C INPUT -p tcp --dport "$https_port" -j ACCEPT &>/dev/null || \
+          sudo iptables -A INPUT -p tcp --dport "$https_port" -j ACCEPT
+        sudo iptables -C INPUT -p tcp --dport "$minio_port" -j ACCEPT &>/dev/null || \
+          sudo iptables -A INPUT -p tcp --dport "$minio_port" -j ACCEPT
+        iptables_changed=true
         ;;
     esac
     log INFO "Ports ${http_port}, ${https_port}, and ${minio_port} opened."
@@ -452,7 +459,10 @@ configure_firewall() {
     log INFO "Adding iptables NAT redirect: 80 → ${http_port}..."
     sudo iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port "$http_port"
     log INFO "Redirect 80 → ${http_port} added."
+    iptables_changed=true
+  fi
 
+  if $iptables_changed; then
     if command -v netfilter-persistent &>/dev/null; then
       sudo netfilter-persistent save
       log INFO "iptables rules persisted via netfilter-persistent."
@@ -466,6 +476,42 @@ configure_firewall() {
   fi
 
   log INFO "Firewall configuration complete."
+}
+
+# ------------------------------------------------------------------ minio cors ---
+# Browsers enforce CORS: a preflight OPTIONS to MinIO fails unless a CORS rule
+# allows the Plane origin. This is invisible to curl but blocks every browser upload.
+configure_minio_cors() {
+  local bucket="${AWS_S3_BUCKET_NAME:-uploads}"
+  local minio_port="${MINIO_PORT:-9000}"
+  log INFO "Configuring CORS on MinIO bucket '${bucket}'..."
+
+  local cors_file; cors_file=$(mktemp /tmp/minio-cors-XXXXXX.json)
+  printf '{"CORSRules":[{"AllowedOrigins":["*"],"AllowedMethods":["GET","PUT","POST","DELETE","HEAD"],"AllowedHeaders":["*"],"ExposeHeaders":["ETag"],"MaxAgeSeconds":3600}]}' \
+    > "$cors_file"
+
+  if $RUNTIME run --rm \
+      --network host \
+      --entrypoint sh \
+      -e AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}" \
+      -e AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}" \
+      -e AWS_DEFAULT_REGION="${AWS_REGION:-us-east-1}" \
+      -v "${cors_file}:/tmp/cors.json:ro" \
+      "${REGISTRY}/amazon/aws-cli:latest" \
+      -c "aws --endpoint-url http://127.0.0.1:${minio_port} \
+              s3api create-bucket --bucket ${bucket} 2>/dev/null || true
+          aws --endpoint-url http://127.0.0.1:${minio_port} \
+              s3api put-bucket-cors \
+                --bucket ${bucket} \
+                --cors-configuration file:///tmp/cors.json" \
+      >> "$LOG_FILE" 2>&1; then
+    log INFO "MinIO CORS configured — browser file uploads enabled."
+  else
+    log WARN "MinIO CORS configuration failed — browser uploads will be blocked."
+    log WARN "See ${LOG_FILE}. Re-run ./deploy.sh or apply manually."
+  fi
+
+  rm -f "$cors_file"
 }
 
 # ------------------------------------------------------------------ deploy ---
@@ -537,6 +583,8 @@ do_deploy() {
     do_rollback
     exit 1
   fi
+
+  configure_minio_cors
 
   # Clean up dangling images to reclaim disk space
   log INFO "Pruning dangling images..."
