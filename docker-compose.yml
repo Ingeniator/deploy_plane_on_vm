@@ -1,3 +1,5 @@
+name: plane
+
 services:
   plane-nginx:
     image: ${REGISTRY}/nginx:alpine
@@ -8,7 +10,7 @@ services:
       # are left unchanged in the template.
       NGINX_ENVSUBST_TEMPLATE_VARS: BUCKET_NAME
     ports:
-      - "${LISTEN_HTTP_PORT:-8080}:80"
+      - "${LISTEN_HTTP_PORT:-8080}:${LISTEN_HTTP_PORT:-8080}"
     volumes:
       - type: bind
         source: ./nginx/default.conf.template

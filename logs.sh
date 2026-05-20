@@ -9,13 +9,13 @@
 #   ./logs.sh <container> -f     — follow one container live
 #   ./logs.sh <container> -e     — errors/warnings from one container
 #
-# Container names: plane-aio  plane-db  plane-redis  plane-mq  plane-minio
+# Container names: plane-nginx  plane-aio  plane-db  plane-redis  plane-mq  plane-minio
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SCRIPT_DIR}/.env"
 TAIL_LINES=50
-ALL_CONTAINERS=(plane-aio plane-db plane-redis plane-mq plane-minio)
+ALL_CONTAINERS=(plane-nginx plane-aio plane-db plane-redis plane-mq plane-minio)
 
 # ------------------------------------------------------------------ colours ---
 if [[ -t 1 ]]; then
@@ -55,19 +55,25 @@ setup_runtime() {
   # Rootless Docker needs an explicit socket path
   if [[ "$RUNTIME" == "docker" && "$EUID" -ne 0 ]]; then
     local sock="${XDG_RUNTIME_DIR:-/run/user/${EUID}}/docker.sock"
-    [[ -S "$sock" ]] && export DOCKER_HOST="unix://${sock}"
+    [[ -S "$sock" ]] && export DOCKER_HOST="unix://${sock}" || true
   fi
 }
 
 # ------------------------------------------------------------------ status ---
 show_status() {
-  printf "${CYAN}${BOLD}%-22s %-12s %-10s %s${NC}\n" "CONTAINER" "STATE" "HEALTH" "IMAGE"
+  printf "${CYAN}${BOLD}%-22s %-12s %-10s %s${NC}\n" "SERVICE" "STATE" "HEALTH" "IMAGE"
   printf '%s\n' "------------------------------------------------------------"
+  cd "$SCRIPT_DIR"
   for c in "${ALL_CONTAINERS[@]}"; do
-    local state image health colour
-    state=$($RUNTIME inspect "$c" --format '{{.State.Status}}' 2>/dev/null || echo "not found")
-    image=$($RUNTIME inspect "$c" --format '{{.Config.Image}}' 2>/dev/null | sed 's|.*/||' || echo "-")
-    health=$($RUNTIME inspect "$c" \
+    local state image health colour cid
+    cid=$($COMPOSE ps -q "$c" 2>/dev/null | head -1)
+    if [[ -z "$cid" ]]; then
+      printf "${YELLOW}%-22s${NC} %-12s %-10s %s\n" "$c" "not found" "-" "-"
+      continue
+    fi
+    state=$($RUNTIME inspect "$cid" --format '{{.State.Status}}' 2>/dev/null || echo "unknown")
+    image=$($RUNTIME inspect "$cid" --format '{{.Config.Image}}' 2>/dev/null | sed 's|.*/||' || echo "-")
+    health=$($RUNTIME inspect "$cid" \
       --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}' 2>/dev/null || echo "-")
 
     case "$state" in
@@ -90,9 +96,10 @@ header() {
 
 logs_snapshot() {
   local containers=("$@")
+  cd "$SCRIPT_DIR"
   for c in "${containers[@]}"; do
     header "$c"
-    $RUNTIME logs --tail "$TAIL_LINES" "$c" 2>&1 || \
+    $COMPOSE logs --tail "$TAIL_LINES" "$c" 2>&1 || \
       printf "${YELLOW}  (container not found or not running)${NC}\n"
     printf '\n'
   done
@@ -100,9 +107,10 @@ logs_snapshot() {
 
 logs_errors() {
   local containers=("$@")
+  cd "$SCRIPT_DIR"
   for c in "${containers[@]}"; do
     local output
-    output=$($RUNTIME logs "$c" 2>&1 | \
+    output=$($COMPOSE logs "$c" 2>&1 | \
       grep -iE '\b(error|err|warn|warning|fatal|critical|exception|traceback|panic)\b' || true)
     if [[ -n "$output" ]]; then
       header "$c"
@@ -120,14 +128,12 @@ logs_errors() {
 
 logs_follow() {
   local containers=("$@")
+  cd "$SCRIPT_DIR"
   if (( ${#containers[@]} == 1 )); then
-    # Single container — stream directly for clean output
     printf "${CYAN}${BOLD}Following: %s  (Ctrl-C to stop)${NC}\n\n" "${containers[0]}"
-    $RUNTIME logs -f "${containers[0]}" 2>&1
+    $COMPOSE logs -f --tail "$TAIL_LINES" "${containers[0]}" 2>&1
   else
-    # Multiple containers — use compose so lines are prefixed with container name
     printf "${CYAN}${BOLD}Following all containers  (Ctrl-C to stop)${NC}\n\n"
-    cd "$SCRIPT_DIR"
     $COMPOSE logs -f --tail 20 "${containers[@]}" 2>&1
   fi
 }

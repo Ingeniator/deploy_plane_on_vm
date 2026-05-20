@@ -1,5 +1,5 @@
 server {
-    listen      80;
+    listen      8080;
 
     # No body-size limit here — Plane and MinIO enforce their own.
     client_max_body_size 0;
@@ -8,11 +8,15 @@ server {
     # pre-signed URL signatures stay valid end-to-end (the signature covers the
     # exact path MinIO receives; stripping a prefix would break verification).
     # BUCKET_NAME is substituted from the .env at container start by envsubst.
-    location /${BUCKET_NAME}/ {
+    location /${BUCKET_NAME} {
         proxy_pass              http://plane-minio:9000;
         proxy_set_header        Host $http_host;
         proxy_request_buffering off;
         proxy_buffering         off;
+    }
+
+    location = /god-mode {
+        return 301 /god-mode/;
     }
 
     # Plane AIO — internal Caddy handles /api/, /space/, /live/, etc.
