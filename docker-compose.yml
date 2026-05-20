@@ -1,11 +1,27 @@
 services:
+  plane-nginx:
+    image: ${REGISTRY}/nginx:alpine
+    restart: always
+    env_file: .env
+    environment:
+      # Limit envsubst to only this variable so nginx variables like $http_host
+      # are left unchanged in the template.
+      NGINX_ENVSUBST_TEMPLATE_VARS: BUCKET_NAME
+    ports:
+      - "${LISTEN_HTTP_PORT:-8080}:80"
+    volumes:
+      - type: bind
+        source: ./nginx/default.conf.template
+        target: /etc/nginx/templates/default.conf.template
+        read_only: true
+    depends_on:
+      - plane-aio
+      - plane-minio
+
   plane-aio:
     image: ${REGISTRY}/makeplane/plane-aio-community:${APP_RELEASE:-stable}
     restart: always
     env_file: .env
-    ports:
-      - "${LISTEN_HTTP_PORT:-8080}:80"
-      - "${LISTEN_HTTPS_PORT:-8443}:443"
     volumes:
       - type: bind
         source: ${DATA_DIR}/aio/data
@@ -82,8 +98,6 @@ services:
     environment:
       MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID}
       MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY}
-    ports:
-      - "${MINIO_PORT:-9000}:9000"
     volumes:
       - type: bind
         source: ${DATA_DIR}/minio

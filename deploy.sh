@@ -51,12 +51,24 @@ check_rootless() {
 
   # Docker rootless uses a per-user socket
   if [[ "$runtime" == "docker" ]]; then
-    local docker_sock="${XDG_RUNTIME_DIR:-/run/user/${EUID}}/docker.sock"
-    if [[ -S "$docker_sock" ]]; then
-      export DOCKER_HOST="unix://${docker_sock}"
-      log INFO "Set DOCKER_HOST=${DOCKER_HOST}"
-    else
-      log WARN "Docker rootless socket not found at ${docker_sock}. Is dockerd --rootless running?"
+    # Prefer an already-set DOCKER_HOST; otherwise probe common rootless socket paths.
+    if [[ -z "${DOCKER_HOST:-}" ]]; then
+      local candidates=(
+        "${XDG_RUNTIME_DIR:-}/docker.sock"           # Linux systemd (XDG set)
+        "/run/user/${EUID}/docker.sock"              # Linux fallback
+        "${HOME}/.docker/run/docker.sock"            # Docker Desktop (macOS/Linux)
+        "${HOME}/.docker/desktop/docker.sock"        # Docker Desktop alternate
+      )
+      for sock in "${candidates[@]}"; do
+        if [[ -S "$sock" ]]; then
+          export DOCKER_HOST="unix://${sock}"
+          log INFO "Set DOCKER_HOST=${DOCKER_HOST}"
+          break
+        fi
+      done
+      if [[ -z "${DOCKER_HOST:-}" ]]; then
+        log WARN "Docker rootless socket not found. Is dockerd --rootless (or Docker Desktop) running?"
+      fi
     fi
   fi
 
@@ -70,7 +82,7 @@ check_rootless() {
       log WARN "User '${USER}' has no entries in: ${missing[*]}"
       log WARN "Rootless Podman needs subordinate UID/GID mappings to run containers."
       local answer
-      read -rp "  Run 'usermod --add-subuids/subgids 100000-165535' for '${USER}' now? [Y/n]: " answer
+      read -rp "  Run 'usermod --add-subuids/subgids 100000-165535' for '${USER}' now? [Y/n]: " answer || true
       answer="${answer:-Y}"
       if [[ "$answer" =~ ^[Yy] ]]; then
         sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
@@ -99,7 +111,7 @@ check_rootless() {
     if ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
       log WARN "Linger is not enabled — containers will stop when you disconnect SSH."
       local answer
-      read -rp "  Enable linger for '${USER}' now (keeps containers alive after logout)? [Y/n]: " answer
+      read -rp "  Enable linger for '${USER}' now (keeps containers alive after logout)? [Y/n]: " answer || true
       answer="${answer:-Y}"
       if [[ "$answer" =~ ^[Yy] ]]; then
         loginctl enable-linger "$USER"
@@ -149,7 +161,7 @@ set_env_var() {
 prompt_secret() {
   local prompt="$1"
   local val
-  read -rsp "  ${prompt} [Enter to auto-generate]: " val; printf '\n' >&2
+  read -rsp "  ${prompt} [Enter to auto-generate]: " val || true; printf '\n' >&2
   if [[ -z "$val" ]]; then
     val=$(openssl rand -hex 16)
     printf '  -> generated\n' >&2
@@ -164,7 +176,7 @@ setup_env() {
 
   # Data directory
   local data_dir
-  read -rp "  Persistent data directory [${SCRIPT_DIR}/data]: " data_dir
+  read -rp "  Persistent data directory [${SCRIPT_DIR}/data]: " data_dir || true
   data_dir="${data_dir:-${SCRIPT_DIR}/data}"
   data_dir="${data_dir/#\~/$HOME}"
   [[ "$data_dir" != /* ]] && data_dir="${SCRIPT_DIR}/${data_dir}"
@@ -172,13 +184,13 @@ setup_env() {
 
   # Registry
   local registry
-  read -rp "  Private registry URL [docker.io]: " registry
+  read -rp "  Private registry URL [docker.io]: " registry || true
   registry="${registry:-docker.io}"
   set_env_var "REGISTRY" "$registry"
 
   # VM IP
   local vm_ip
-  read -rp "  VM IP address [127.0.0.1]: " vm_ip
+  read -rp "  VM IP address [127.0.0.1]: " vm_ip || true
   vm_ip="${vm_ip:-127.0.0.1}"
   set_env_var "DOMAIN_NAME"          "$vm_ip"
   set_env_var "APP_DOMAIN"           "$vm_ip"
@@ -203,10 +215,9 @@ setup_env() {
   minio_secret=$(prompt_secret "MinIO secret key")
   set_env_var "AWS_SECRET_ACCESS_KEY" "$minio_secret"
 
-  # MinIO must be reachable by the browser — pre-signed upload/download URLs embed
-  # this address. Using the VM's public IP on port 9000 (exposed in docker-compose).
-  local minio_port="${MINIO_PORT:-9000}"
-  set_env_var "AWS_S3_ENDPOINT_URL" "http://${vm_ip}:${minio_port}"
+  # nginx proxies /uploads/ to MinIO internally, so the browser-facing endpoint
+  # is just the main app URL — no separate MinIO port needed.
+  set_env_var "AWS_S3_ENDPOINT_URL" "http://${vm_ip}:${http_port}"
 
   # Crypto secrets — always auto-generated, no reason to choose manually
   set_env_var "SECRET_KEY"             "$(openssl rand -hex 32)"
@@ -235,12 +246,12 @@ load_env() {
 registry_login() {
   log INFO "Registry login: ${REGISTRY}"
   local reg_user reg_pass
-  read -rp "  Registry username (Enter to skip): " reg_user
+  read -rp "  Registry username (Enter to skip): " reg_user || true
   if [[ -z "$reg_user" ]]; then
     log INFO "Skipping registry login."
     return 0
   fi
-  read -rsp "  Registry password: " reg_pass
+  read -rsp "  Registry password: " reg_pass || true
   printf '\n'
   $RUNTIME login "${REGISTRY}" \
     --username "$reg_user" \
@@ -291,18 +302,35 @@ pull_infra_images() {
 
 # ------------------------------------------------------------------ health check ---
 wait_healthy() {
+  # Stage 1: wait for nginx to respond (confirms containers are up and routing works)
   log INFO "Health check: ${HEALTH_URL} (timeout ${HEALTH_TIMEOUT}s)"
   local elapsed=0
   while (( elapsed < HEALTH_TIMEOUT )); do
     if curl -sf --max-time 5 "${HEALTH_URL}" &>/dev/null; then
-      log INFO "Health check passed after ${elapsed}s."
-      return 0
+      log INFO "Nginx responding after ${elapsed}s."
+      break
     fi
     sleep "$HEALTH_INTERVAL"
     (( elapsed += HEALTH_INTERVAL ))
     log INFO "  still waiting... ${elapsed}s"
+    (( elapsed >= HEALTH_TIMEOUT )) && { log ERROR "Health check timed out."; return 1; }
   done
-  log ERROR "Health check timed out after ${HEALTH_TIMEOUT}s."
+
+  # Stage 2: wait for the DB migrator to finish — the API is not usable until it exits.
+  # The migrator runs once on startup, applies all pending migrations, then exits 0.
+  log INFO "Waiting for DB migrations to complete..."
+  elapsed=0
+  while (( elapsed < HEALTH_TIMEOUT )); do
+    if $COMPOSE logs plane-aio 2>/dev/null \
+         | grep -q "exited: migrator (exit status 0; expected)"; then
+      log INFO "Migrations complete after ${elapsed}s."
+      return 0
+    fi
+    sleep "$HEALTH_INTERVAL"
+    (( elapsed += HEALTH_INTERVAL ))
+    log INFO "  migrations still running... ${elapsed}s"
+  done
+  log ERROR "Migrations did not complete within ${HEALTH_TIMEOUT}s."
   return 1
 }
 
@@ -327,7 +355,6 @@ do_rollback() {
 configure_firewall() {
   local http_port="${LISTEN_HTTP_PORT:-8080}"
   local https_port="${LISTEN_HTTPS_PORT:-8443}"
-  local minio_port="${MINIO_PORT:-9000}"
 
   # Detect active firewall
   local fw_type="none"
@@ -348,19 +375,16 @@ configure_firewall() {
   # firewalld: --add-forward-port opens port 80 and redirects to http_port in one
   # rule — no need to open http_port separately (firewalld handles this internally)
   if [[ "$fw_type" == "firewalld" ]]; then
-    local fwd_set=false https_open=false minio_open=false
+    local fwd_set=false https_open=false
     if sudo firewall-cmd --query-forward-port="port=80:proto=tcp:toport=${http_port}" &>/dev/null 2>&1; then
       fwd_set=true
     fi
     if sudo firewall-cmd --query-port="${https_port}/tcp" &>/dev/null 2>&1; then
       https_open=true
     fi
-    if sudo firewall-cmd --query-port="${minio_port}/tcp" &>/dev/null 2>&1; then
-      minio_open=true
-    fi
 
-    if $fwd_set && $https_open && $minio_open; then
-      log INFO "firewalld already configured (80→${http_port} forward + ${https_port} + ${minio_port} open). Nothing to do."
+    if $fwd_set && $https_open; then
+      log INFO "firewalld already configured (80→${http_port} forward + ${https_port} open). Nothing to do."
       return 0
     fi
 
@@ -368,9 +392,8 @@ configure_firewall() {
     log INFO "Firewall changes needed (firewalld):"
     $fwd_set    || log INFO "  - Add forward-port: 80 → ${http_port} (access without port in URL)"
     $https_open || log INFO "  - Open port ${https_port}/tcp"
-    $minio_open || log INFO "  - Open port ${minio_port}/tcp (MinIO — required for file uploads)"
     local answer
-    read -rp "  Apply firewall changes now (requires sudo)? [Y/n]: " answer
+    read -rp "  Apply firewall changes now (requires sudo)? [Y/n]: " answer || true
     answer="${answer:-Y}"
     if [[ "$answer" =~ ^[Nn] ]]; then
       log WARN "Skipping firewall configuration. The app may not be reachable externally."
@@ -379,7 +402,6 @@ configure_firewall() {
 
     $fwd_set    || sudo firewall-cmd --add-forward-port="port=80:proto=tcp:toport=${http_port}" --permanent
     $https_open || sudo firewall-cmd --add-port="${https_port}/tcp" --permanent
-    $minio_open || sudo firewall-cmd --add-port="${minio_port}/tcp" --permanent
     sudo firewall-cmd --reload
     log INFO "Firewall configuration complete."
     return 0
@@ -394,15 +416,13 @@ configure_firewall() {
     ufw)
       local ufw_status; ufw_status=$(sudo ufw status 2>/dev/null)
       if echo "$ufw_status" | grep -q "${http_port}" && \
-         echo "$ufw_status" | grep -q "${https_port}" && \
-         echo "$ufw_status" | grep -q "${minio_port}"; then
+         echo "$ufw_status" | grep -q "${https_port}"; then
         ports_open=true
       fi
       ;;
     iptables)
       if sudo iptables -C INPUT -p tcp --dport "$http_port" -j ACCEPT &>/dev/null && \
-         sudo iptables -C INPUT -p tcp --dport "$https_port" -j ACCEPT &>/dev/null && \
-         sudo iptables -C INPUT -p tcp --dport "$minio_port" -j ACCEPT &>/dev/null; then
+         sudo iptables -C INPUT -p tcp --dport "$https_port" -j ACCEPT &>/dev/null; then
         ports_open=true
       fi
       ;;
@@ -420,10 +440,10 @@ configure_firewall() {
 
   printf '\n'
   log INFO "Firewall changes needed (${fw_type}):"
-  $ports_open   || log INFO "  - Open ports ${http_port}/tcp, ${https_port}/tcp, and ${minio_port}/tcp (MinIO)"
+  $ports_open   || log INFO "  - Open ports ${http_port}/tcp and ${https_port}/tcp"
   $redirect_set || log INFO "  - Add iptables NAT redirect: 80 → ${http_port} (access without port in URL)"
   local answer
-  read -rp "  Apply firewall changes now (requires sudo)? [Y/n]: " answer
+  read -rp "  Apply firewall changes now (requires sudo)? [Y/n]: " answer || true
   answer="${answer:-Y}"
   if [[ "$answer" =~ ^[Nn] ]]; then
     log WARN "Skipping firewall configuration. The app may not be reachable externally."
@@ -433,12 +453,11 @@ configure_firewall() {
   local iptables_changed=false
 
   if ! $ports_open; then
-    log INFO "Opening ports ${http_port}, ${https_port}, and ${minio_port}..."
+    log INFO "Opening ports ${http_port} and ${https_port}..."
     case "$fw_type" in
       ufw)
         sudo ufw allow "${http_port}/tcp"
         sudo ufw allow "${https_port}/tcp"
-        sudo ufw allow "${minio_port}/tcp"
         sudo ufw reload
         ;;
       iptables)
@@ -447,12 +466,10 @@ configure_firewall() {
           sudo iptables -A INPUT -p tcp --dport "$http_port"  -j ACCEPT
         sudo iptables -C INPUT -p tcp --dport "$https_port" -j ACCEPT &>/dev/null || \
           sudo iptables -A INPUT -p tcp --dport "$https_port" -j ACCEPT
-        sudo iptables -C INPUT -p tcp --dport "$minio_port" -j ACCEPT &>/dev/null || \
-          sudo iptables -A INPUT -p tcp --dport "$minio_port" -j ACCEPT
         iptables_changed=true
         ;;
     esac
-    log INFO "Ports ${http_port}, ${https_port}, and ${minio_port} opened."
+    log INFO "Ports ${http_port} and ${https_port} opened."
   fi
 
   if ! $redirect_set; then
@@ -476,42 +493,6 @@ configure_firewall() {
   fi
 
   log INFO "Firewall configuration complete."
-}
-
-# ------------------------------------------------------------------ minio cors ---
-# Browsers enforce CORS: a preflight OPTIONS to MinIO fails unless a CORS rule
-# allows the Plane origin. This is invisible to curl but blocks every browser upload.
-configure_minio_cors() {
-  local bucket="${AWS_S3_BUCKET_NAME:-uploads}"
-  local minio_port="${MINIO_PORT:-9000}"
-  log INFO "Configuring CORS on MinIO bucket '${bucket}'..."
-
-  local cors_file; cors_file=$(mktemp /tmp/minio-cors-XXXXXX.json)
-  printf '{"CORSRules":[{"AllowedOrigins":["*"],"AllowedMethods":["GET","PUT","POST","DELETE","HEAD"],"AllowedHeaders":["*"],"ExposeHeaders":["ETag"],"MaxAgeSeconds":3600}]}' \
-    > "$cors_file"
-
-  if $RUNTIME run --rm \
-      --network host \
-      --entrypoint sh \
-      -e AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}" \
-      -e AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}" \
-      -e AWS_DEFAULT_REGION="${AWS_REGION:-us-east-1}" \
-      -v "${cors_file}:/tmp/cors.json:ro" \
-      "${REGISTRY}/amazon/aws-cli:latest" \
-      -c "aws --endpoint-url http://127.0.0.1:${minio_port} \
-              s3api create-bucket --bucket ${bucket} 2>/dev/null || true
-          aws --endpoint-url http://127.0.0.1:${minio_port} \
-              s3api put-bucket-cors \
-                --bucket ${bucket} \
-                --cors-configuration file:///tmp/cors.json" \
-      >> "$LOG_FILE" 2>&1; then
-    log INFO "MinIO CORS configured — browser file uploads enabled."
-  else
-    log WARN "MinIO CORS configuration failed — browser uploads will be blocked."
-    log WARN "See ${LOG_FILE}. Re-run ./deploy.sh or apply manually."
-  fi
-
-  rm -f "$cors_file"
 }
 
 # ------------------------------------------------------------------ deploy ---
@@ -559,7 +540,7 @@ do_deploy() {
 
   # Start infra services (idempotent — skips already-running containers)
   log INFO "Starting infrastructure services..."
-  $COMPOSE up -d plane-db plane-redis plane-mq plane-minio
+  $COMPOSE up -d plane-db plane-redis plane-mq plane-minio plane-nginx
 
   # Wait for DB to be connectable before bringing up AIO
   log INFO "Waiting for postgres to accept connections..."
@@ -574,7 +555,11 @@ do_deploy() {
   log INFO "Postgres ready."
 
   # Deploy AIO (compose handles depends_on conditions for redis, mq, minio)
+  # Stop and remove the existing AIO container before recreating — compose's
+  # auto-recreate path has a bug with long-form volume syntax on some platforms.
   log INFO "Starting plane-aio..."
+  $COMPOSE stop plane-aio 2>/dev/null || true
+  $COMPOSE rm -f plane-aio 2>/dev/null || true
   $COMPOSE up -d plane-aio
 
   # Application health check with auto-rollback
@@ -583,8 +568,6 @@ do_deploy() {
     do_rollback
     exit 1
   fi
-
-  configure_minio_cors
 
   # Clean up dangling images to reclaim disk space
   log INFO "Pruning dangling images..."
